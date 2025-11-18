@@ -1,68 +1,89 @@
+# Лабораторна робота №3 — Flask + PostgreSQL + ORM  
+## Тема: Валідація, обробка помилок та ORM у бекенд-застосунку
 
-# Render.com
-https://flask-lab2.onrender.com
+**Студент:** Пашко Максим, група ІО-32  
+**Варіант:** №2 — *Користувацькі категорії витрат*  
 
-# Lab 2 — Expenses REST API (Flask)
+Ця лабораторна робота **продовжує проєкт з Лабораторної роботи №2**.  
+Зберігається структура ендпоінтів, але замість роботи “в пам’яті” тепер використовується:
 
-Базове REST API для обліку витрат з in-memory сховищем.
+- база даних **PostgreSQL** (у Docker-контейнері),
+- **SQLAlchemy** як ORM,
+- **Flask-Migrate** для міграцій,
+- **Marshmallow** для валідації вхідних даних,
+- єдина JSON-структура для помилок.
 
-## Швидкий старт (локально)
+---
 
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/Mac: source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-# сервер підніметься на http://127.0.0.1:8080
-```
+## Основний функціонал
 
-Або через Gunicorn:
+### 1. Сутності
 
-```bash
-gunicorn app:app
-```
+- **User**
+  - `id: int`
+  - `name: str` (унікальне ім’я)
 
-## Ендпоінти
+- **Category**
+  - `id: int`
+  - `name: str`
+  - `is_global: bool`
+  - `user_id: int | null` — власник категорії або `null` для глобальних
 
-### Users
-- **POST /user** — створити користувача, тіло: `{ "name": "Max" }`
-- **GET /user/<id>** — отримати користувача
-- **DELETE /user/<id>** — видалити користувача (і пов'язані записи)
-- **GET /users** — список користувачів
+- **Record**
+  - `id: int`
+  - `user_id: int`
+  - `category_id: int`
+  - `amount: float`
+  - `created_at: datetime`
 
-### Categories
-- **GET /category** — список категорій
-- **POST /category** — створити категорію, тіло: `{ "name": "Food" }`
-- **DELETE /category?id=<id>** — видалити категорію (і пов'язані записи)
+---
 
-### Records
-- **POST /record** — створити запис, тіло:
-  ```json
-  {
-    "user_id": 1,
-    "category_id": 1,
-    "amount": 99.5,
-    "created_at": "2025-10-13T10:00:00Z" // optional
-  }
-  ```
-- **GET /record/<id>** — отримати запис
-- **DELETE /record/<id>** — видалити запис
-- **GET /record?user_id=...&category_id=...** — фільтрація. **Принаймні один** параметр обовʼязковий.
+### 2. Логіка варіанту №2 — Користувацькі категорії витрат
 
-### Health
-- **GET /health** — `{ "status": "ok" }`
+- **Глобальні категорії**:
+  - `is_global = true`
+  - `user_id = null`
+  - доступні всім користувачам
 
-## Postman
-У теці `postman/` є:
-- `Lab2 Expenses API.postman_collection.json` — колекція з усіма запитами
-- `env_local.postman_environment.json` — середовище для локального запуску (`baseUrl` = `http://127.0.0.1:8080`)
-- `env_production.postman_environment.json` — приклад прод-середовища (замінити `https://YOUR-RENDER-URL`)
-- `flow.postman_flow.json` — мінімальний Postman Flow (можна імпортувати у Flows)
+- **Користувацькі категорії**:
+  - `is_global = false`
+  - `user_id = <id користувача>`
+  - бачить і може використовувати **тільки власник**
 
-## Postman Flow
-![Flow](./зображення_2025-10-30_133558970.png)
+- При створенні запису витрати (`POST /record`):
+  - якщо категорія **глобальна** → дозволено для будь-якого користувача
+  - якщо категорія **користувацька** → дозволено **тільки користувачу-власнику**
+  - інакше повертається помилка:
+    ```json
+    { "error": "forbidden_category" }
+    ```
 
-## Примітки
-- Дані **не** зберігаються між рестартами — це свідомо (вимога лабораторної перед БД).
-- Валідація мінімальна; розширена валідація буде у наступній лабораторній.
+---
+
+## Технології
+
+- Python 3.11
+- Flask
+- Flask-SQLAlchemy
+- Flask-Migrate
+- Marshmallow
+- PostgreSQL (Docker)
+- psycopg2-binary
+- Postman (для тестування API)
+
+---
+
+## Структура проєкту
+
+```text
+flask_lab3/
+  app.py
+  config.py
+  docker-compose.yaml
+  requirements.txt
+  migrations/
+  README.md
+  postman/
+    Lab2 Expenses API.postman_collection.json
+    env_local.postman_environment.json
+    ...
