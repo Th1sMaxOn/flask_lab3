@@ -1,5 +1,7 @@
-Flask
-Flask-SQLAlchemy
-Flask-Migrate
-marshmallow
-psycopg2-binary
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-Migrate==4.0.7
+marshmallow==3.21.3
+psycopg[binary]==3.2.9
+flask-jwt-extended==4.6.0
+passlib==1.7.4

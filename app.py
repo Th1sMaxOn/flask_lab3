@@ -1,9 +1,17 @@
 import os
 from datetime import datetime
+from typing import Any, Dict, cast
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    get_jwt_identity,
+    jwt_required,
+)
+from passlib.hash import pbkdf2_sha256
 from marshmallow import Schema, fields, validates, ValidationError
 from marshmallow.validate import Length, Range
 
@@ -13,6 +21,7 @@ from marshmallow.validate import Length, Range
 
 db = SQLAlchemy()
 migrate = Migrate()
+jwt = JWTManager()
 
 
 # -------------------------
@@ -23,7 +32,9 @@ class User(db.Model):
     __tablename__ = "users"
 
     id = db.Column(db.Integer, primary_key=True)
+    # keep "name" column to avoid breaking Lab3 DB; treat it as username
     name = db.Column(db.String(120), nullable=False, unique=True)
+    password_hash = db.Column(db.String(255), nullable=False)
 
     categories = db.relationship(
         "Category",
@@ -78,15 +89,24 @@ class Record(db.Model):
 # SCHEMAS
 # -------------------------
 
-class UserSchema(Schema):
-    id = fields.Int(dump_only=True)
+class RegisterSchema(Schema):
     name = fields.Str(required=True, validate=Length(min=1, max=120))
+    password = fields.Str(required=True, validate=Length(min=6, max=128))
 
     @validates("name")
     def validate_name(self, value, **kwargs):
         if not value.strip():
             raise ValidationError("Name must not be empty.")
 
+
+class LoginSchema(Schema):
+    name = fields.Str(required=True, validate=Length(min=1, max=120))
+    password = fields.Str(required=True, validate=Length(min=1, max=128))
+
+
+class UserSchema(Schema):
+    id = fields.Int(dump_only=True)
+    name = fields.Str(required=True, validate=Length(min=1, max=120))
 
 
 class CategorySchema(Schema):
@@ -96,39 +116,40 @@ class CategorySchema(Schema):
     user_id = fields.Int(allow_none=True)
 
 
-class CategoryQuerySchema(Schema):
-    user_id = fields.Int(required=False, allow_none=True)
+class CategoryCreateSchema(Schema):
+    name = fields.Str(required=True, validate=Length(min=1, max=120))
+    is_global = fields.Bool(required=True)
 
 
 class RecordSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Int(required=True)
+    user_id = fields.Int(dump_only=True)
     category_id = fields.Int(required=True)
     created_at = fields.DateTime(dump_only=True)
     amount = fields.Float(required=True, validate=Range(min=0.0))
 
 
 class RecordQuerySchema(Schema):
-    user_id = fields.Int(required=False)
     category_id = fields.Int(required=False)
 
 
-# Instantiate schemas
+register_schema = RegisterSchema()
+login_schema = LoginSchema()
+
 user_schema = UserSchema()
 users_schema = UserSchema(many=True)
 
 category_schema = CategorySchema()
 categories_schema = CategorySchema(many=True)
+category_create_schema = CategoryCreateSchema()
 
 record_schema = RecordSchema()
 records_schema = RecordSchema(many=True)
-
 record_query_schema = RecordQuerySchema()
-category_query_schema = CategoryQuerySchema()
 
 
 # -------------------------------------------------------------
-# ERROR HANDLERS
+# ERROR HELPERS
 # -------------------------------------------------------------
 
 def make_error(message: str, status_code: int = 400, extra=None):
@@ -155,13 +176,35 @@ def register_error_handlers(app: Flask):
 
 
 # -------------------------------------------------------------
+# JWT ERROR HANDLERS
+# -------------------------------------------------------------
+
+def register_jwt_handlers(_jwt: JWTManager):
+    @_jwt.unauthorized_loader
+    def missing_token(err: str):
+        return make_error("missing_token", 401, extra={"details": err})
+
+    @_jwt.invalid_token_loader
+    def invalid_token(err: str):
+        return make_error("invalid_token", 401, extra={"details": err})
+
+    @_jwt.expired_token_loader
+    def expired_token(jwt_header, jwt_payload):
+        return make_error("expired_token", 401)
+
+    @_jwt.revoked_token_loader
+    def revoked_token(jwt_header, jwt_payload):
+        return make_error("revoked_token", 401)
+
+
+# -------------------------------------------------------------
 # APPLICATION FACTORY
 # -------------------------------------------------------------
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # Base config
+    # Database: prefer env in Docker; fallback for local
     app.config.setdefault(
         "SQLALCHEMY_DATABASE_URI",
         os.environ.get(
@@ -172,11 +215,18 @@ def create_app() -> Flask:
     app.config.setdefault("SQLALCHEMY_TRACK_MODIFICATIONS", False)
     app.config.setdefault("JSON_SORT_KEYS", False)
 
-    # load config.py if present
+    # JWT
+    app.config.setdefault("JWT_SECRET_KEY", os.environ.get("JWT_SECRET_KEY", "change-me"))
+    app.config.setdefault("JWT_ACCESS_TOKEN_EXPIRES", int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRES", "3600")))
+
+    # load config.py if present (should not overwrite DATABASE_URL / JWT_SECRET_KEY ideally)
     app.config.from_pyfile("config.py", silent=True)
 
     db.init_app(app)
     migrate.init_app(app, db)
+
+    jwt.init_app(app)
+    register_jwt_handlers(jwt)
 
     register_error_handlers(app)
     register_routes(app)
@@ -190,159 +240,193 @@ def create_app() -> Flask:
 
 def register_routes(app: Flask):
 
-    # ----------- HEALTH ----------
+    # ----------- PUBLIC ----------
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return jsonify({"status": "ok"})
 
     @app.get("/")
     def index():
-        return {
-            "project": "Lab3 Expenses API",
+        return jsonify({
+            "project": "Lab4 Expenses API (JWT)",
             "variant": 2,
-            "note": "This is an extended version of Lab2 with ORM, DB, Validation.",
-            "try": ["/users", "/category", "/record?user_id=1"]
-        }
+            "auth": {"register": "/auth/register", "login": "/auth/login"}
+        })
 
-    # ----------- USERS -----------
+    # ----------- AUTH (PUBLIC) -----------
 
-    @app.post("/users")
-    def create_user():
-        data = user_schema.load(request.get_json() or {})
+    @app.post("/auth/register")
+    def auth_register():
+        data = cast(Dict[str, Any], register_schema.load(request.get_json() or {}))
+        name = data["name"].strip()
+        password = data["password"]
 
-        # unique name check
-        if User.query.filter_by(name=data["name"]).first():
+        if User.query.filter_by(name=name).first():
             raise ValidationError({"name": ["User with this name already exists"]})
 
-        user = User(name=data["name"])
+        user = User(name=name, password_hash=pbkdf2_sha256.hash(password))
         db.session.add(user)
         db.session.commit()
-        return user_schema.dump(user), 201
 
+        r = jsonify({"id": user.id, "name": user.name})
+        r.status_code = 201
+        return r
+
+    @app.post("/auth/login")
+    def auth_login():
+        data = cast(Dict[str, Any], login_schema.load(request.get_json() or {}))
+        name = data["name"].strip()
+        password = data["password"]
+
+        user = User.query.filter_by(name=name).first()
+        if not user or not pbkdf2_sha256.verify(password, user.password_hash):
+            return make_error("invalid_credentials", 401)
+
+        access_token = create_access_token(identity=str(user.id))
+        return jsonify({"access_token": access_token, "user": {"id": user.id, "name": user.name}})
+
+    # ----------- PROTECTED ----------
+    # Everything below requires JWT
+
+    @app.get("/me")
+    @jwt_required()
+    def me():
+        user_id = int(get_jwt_identity())
+        user = User.query.get(user_id)
+        if not user:
+            return make_error("user_not_found", 404)
+        return jsonify(user_schema.dump(user))
+
+    # Optional: list users (protected)
     @app.get("/users")
+    @jwt_required()
     def list_users():
         users = User.query.order_by(User.id).all()
-        return {"items": users_schema.dump(users), "total": len(users)}
-
-    @app.get("/user/<int:user_id>")
-    def get_user(user_id):
-        user = User.query.get(user_id)
-        if not user:
-            return make_error("user_not_found", 404)
-        return user_schema.dump(user)
-
-    @app.delete("/user/<int:user_id>")
-    def delete_user(user_id):
-        user = User.query.get(user_id)
-        if not user:
-            return make_error("user_not_found", 404)
-        db.session.delete(user)
-        db.session.commit()
-        return {"deleted": True, "user_id": user_id}
+        return jsonify({"items": users_schema.dump(users), "total": len(users)})
 
     # ----------- CATEGORIES (VARIANT 2) -----------
 
     @app.get("/category")
+    @jwt_required()
     def list_categories():
-        args = category_query_schema.load(request.args)
-        user_id = args.get("user_id")
-
-        query = Category.query
-
-        if user_id is not None:
-            # all global OR user’s own categories
-            query = query.filter(
-                db.or_(
-                    Category.is_global.is_(True),
-                    Category.user_id == user_id
-                )
+        user_id = int(get_jwt_identity())
+        categories = (
+            Category.query.filter(
+                db.or_(Category.is_global.is_(True), Category.user_id == user_id)
             )
-
-        categories = query.order_by(Category.id).all()
-        return {"items": categories_schema.dump(categories), "total": len(categories)}
+            .order_by(Category.id)
+            .all()
+        )
+        return jsonify({"items": categories_schema.dump(categories), "total": len(categories)})
 
     @app.post("/category")
+    @jwt_required()
     def create_category():
-        data = category_schema.load(request.get_json() or {})
+        user_id = int(get_jwt_identity())
+        data = cast(Dict[str, Any], category_create_schema.load(request.get_json() or {}))
 
-        is_global = data["is_global"]
-        user_id = data.get("user_id")
+        is_global = bool(data["is_global"])
+        if is_global:
+            category = Category(name=data["name"], is_global=True, user_id=None)
+        else:
+            category = Category(name=data["name"], is_global=False, user_id=user_id)
 
-        if is_global and user_id is not None:
-            raise ValidationError({"user_id": ["Global category must not have user_id"]})
-
-        if not is_global:
-            if user_id is None:
-                raise ValidationError({"user_id": ["User-specific category requires user_id"]})
-            if not User.query.get(user_id):
-                return make_error("user_not_found", 404)
-
-        category = Category(
-            name=data["name"],
-            is_global=is_global,
-            user_id=None if is_global else user_id
-        )
         db.session.add(category)
         db.session.commit()
 
-        return category_schema.dump(category), 201
+        r = jsonify(category_schema.dump(category))
+        r.status_code = 201
+        return r
 
     @app.delete("/category/<int:category_id>")
-    def delete_category(category_id):
+    @jwt_required()
+    def delete_category(category_id: int):
+        user_id = int(get_jwt_identity())
+
         cat = Category.query.get(category_id)
         if not cat:
             return make_error("category_not_found", 404)
+
+        if not cat.is_global and cat.user_id != user_id:
+            return make_error("forbidden_category", 403)
+
         db.session.delete(cat)
         db.session.commit()
-        return {"deleted": True, "category_id": category_id}
+        return jsonify({"deleted": True, "category_id": category_id})
+
+    # keep Lab3 alias too (protected)
+    @app.delete("/category")
+    @jwt_required()
+    def delete_category_by_query():
+        category_id = request.args.get("id", type=int)
+        if not category_id:
+            return make_error("missing_category_id", 400)
+        return delete_category(category_id)
 
     # ----------- RECORDS -----------
 
     @app.post("/record")
+    @jwt_required()
     def create_record():
-        data = record_schema.load(request.get_json() or {})
-
-        user = User.query.get(data["user_id"])
-        if not user:
-            return make_error("user_not_found", 404)
+        user_id = int(get_jwt_identity())
+        data = cast(Dict[str, Any], record_schema.load(request.get_json() or {}))
 
         category = Category.query.get(data["category_id"])
         if not category:
             return make_error("category_not_found", 404)
 
-        # Variant 2 rule: only owner may use user-specific category
-        if not category.is_global and category.user_id != user.id:
-            return make_error("forbidden_category", 400)
+        if not category.is_global and category.user_id != user_id:
+            return make_error("forbidden_category", 403)
 
         record = Record(
-            user=user,
-            category=category,
-            amount=data["amount"]
+            user_id=user_id,
+            category_id=category.id,
+            amount=float(data["amount"])
         )
         db.session.add(record)
         db.session.commit()
 
-        return record_schema.dump(record), 201
+        r = jsonify(record_schema.dump(record))
+        r.status_code = 201
+        return r
 
     @app.get("/record")
+    @jwt_required()
     def list_records():
-        args = record_query_schema.load(request.args)
-
-        user_id = args.get("user_id")
+        user_id = int(get_jwt_identity())
+        args = cast(Dict[str, Any], record_query_schema.load(request.args))
         category_id = args.get("category_id")
 
-        if user_id is None and category_id is None:
-            return make_error("need_user_id_or_category_id", 400)
-
-        query = Record.query
-
-        if user_id is not None:
-            query = query.filter_by(user_id=user_id)
+        query = Record.query.filter_by(user_id=user_id)
         if category_id is not None:
             query = query.filter_by(category_id=category_id)
 
         records = query.order_by(Record.id).all()
-        return {"items": records_schema.dump(records), "total": len(records)}
+        return jsonify({"items": records_schema.dump(records), "total": len(records)})
+
+    @app.get("/record/<int:record_id>")
+    @jwt_required()
+    def get_record(record_id: int):
+        user_id = int(get_jwt_identity())
+        record = Record.query.get(record_id)
+        if not record:
+            return make_error("record_not_found", 404)
+        if record.user_id != user_id:
+            return make_error("forbidden_record", 403)
+        return jsonify(record_schema.dump(record))
+
+    @app.delete("/record/<int:record_id>")
+    @jwt_required()
+    def delete_record(record_id: int):
+        user_id = int(get_jwt_identity())
+        record = Record.query.get(record_id)
+        if not record:
+            return make_error("record_not_found", 404)
+        if record.user_id != user_id:
+            return make_error("forbidden_record", 403)
+        db.session.delete(record)
+        db.session.commit()
+        return jsonify({"deleted": True, "record_id": record_id})
 
 
 # -------------------------------------------------------------

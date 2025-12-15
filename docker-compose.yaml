@@ -10,3 +10,16 @@ services:
       POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/expenses_db
+      PORT: 8080
+      JWT_SECRET_KEY: "super-secret-key-123"
+      JWT_ACCESS_TOKEN_EXPIRES: 3600
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db

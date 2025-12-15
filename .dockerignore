@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+dist/
+build/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+node_modules/
