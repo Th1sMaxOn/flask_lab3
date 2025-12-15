@@ -1,9 +1,17 @@
 import os
 
-SQLALCHEMY_DATABASE_URI = os.getenv(
+raw = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/expenses_db",
+    "postgresql+psycopg://postgres:postgres@localhost:5432/expenses_db",
 )
+
+if raw.startswith("postgres://"):
+    raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
+
+if raw.startswith("postgresql://") and "+psycopg" not in raw:
+    raw = raw.replace("postgresql://", "postgresql+psycopg://", 1)
+
+SQLALCHEMY_DATABASE_URI = raw
 SQLALCHEMY_TRACK_MODIFICATIONS = False
 JSON_SORT_KEYS = False
 
